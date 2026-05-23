@@ -1,5 +1,11 @@
 /**
  * Signal Handler - Routes WebSocket messages between peers
+ *
+ * FIX: handleCreateRoom and handleJoinRoom previously re-registered the
+ * original WebSocket under a newly generated peerId while leaving the
+ * original peerId dangling in PeerService.  All subsequent sends went to
+ * the new (unused) peerId and were silently dropped.
+ * The handler now uses the connection's own peerId throughout.
  */
 
 import WebSocket from 'ws';
@@ -10,6 +16,7 @@ import {
   ServerSignal,
   isClientSignal,
   createPeerId,
+  RoomId,
 } from '../types';
 
 export class SignalHandler {
@@ -28,6 +35,9 @@ export class SignalHandler {
     try {
       const signal = JSON.parse(message);
 
+      // keep-alive ping — handle before type-guard
+      if (signal.type === 'ping') return;
+
       if (!isClientSignal(signal)) {
         this.sendErrorToPeer(peerId, 'Invalid signal format');
         return;
@@ -37,87 +47,78 @@ export class SignalHandler {
         case 'create_room':
           this.handleCreateRoom(peerId);
           break;
-
         case 'join_room':
           this.handleJoinRoom(peerId, signal.roomId);
           break;
-
         case 'offer':
           this.handleOffer(peerId, signal.roomId, signal.sdp);
           break;
-
         case 'answer':
           this.handleAnswer(peerId, signal.roomId, signal.sdp);
           break;
-
         case 'ice_candidate':
           this.handleIceCandidate(peerId, signal.roomId, signal.candidate);
           break;
-
         case 'disconnect':
           this.handleDisconnect(peerId, signal.roomId);
           break;
-
         default:
           this.sendErrorToPeer(peerId, 'Unknown signal type');
       }
     } catch (error) {
-      console.error('[SignalHandler] Error parsing message:', error);
+      console.error(`[SignalHandler] Error parsing message from ${peerId}:`, error);
       this.sendErrorToPeer(peerId, 'Failed to parse message');
     }
   }
 
   /**
    * Handle create_room signal from sender
+   * Uses the connection's own peerId — no extra peerId is generated.
    */
   private handleCreateRoom(peerId: any): void {
-    const { roomId, peerId: senderId } = this.roomService.createRoom();
-
-    this.peerService.registerPeer(senderId, this.peerService.getPeerSocket(peerId) || new WebSocket(''));
-    this.peerService.setPeerRoom(senderId, roomId);
+    const roomId = this.roomService.createRoomForPeer(peerId);
 
     const response: ServerSignal = {
       type: 'room_created',
       roomId,
     };
 
-    this.peerService.sendToPeer(senderId, response);
-    console.log(`[SignalHandler] Room created: ${roomId}`);
+    this.peerService.setPeerRoom(createPeerId(peerId), roomId);
+    this.peerService.sendToPeer(createPeerId(peerId), response);
+    console.log(`[SignalHandler] Room created: ${roomId} by ${peerId}`);
   }
 
   /**
    * Handle join_room signal from receiver
    */
   private handleJoinRoom(peerId: any, roomId: any): void {
-    const result = this.roomService.joinRoom(roomId);
+    const ok = this.roomService.joinRoomAsPeer(roomId, peerId);
 
-    if (!result) {
+    if (!ok) {
       this.sendErrorToPeer(peerId, 'Room not found or already has receiver');
       return;
     }
 
-    const { peerId: receiverId, room } = result;
+    this.peerService.setPeerRoom(createPeerId(peerId), roomId);
 
-    this.peerService.registerPeer(receiverId, this.peerService.getPeerSocket(peerId) || new WebSocket(''));
-    this.peerService.setPeerRoom(receiverId, roomId);
-
-    // Send confirmation to receiver
+    // Confirm to receiver
     const joinedResponse: ServerSignal = {
       type: 'room_joined',
       roomId,
     };
-    this.peerService.sendToPeer(receiverId, joinedResponse);
+    this.peerService.sendToPeer(createPeerId(peerId), joinedResponse);
 
-    // Notify sender that peer has joined
-    if (room.sender) {
+    // Notify sender
+    const room = this.roomService.getRoom(roomId);
+    if (room?.senderPeerId) {
       const peerJoinedResponse: ServerSignal = {
         type: 'peer_joined',
-        peerId: receiverId,
+        peerId: createPeerId(peerId),
       };
-      this.peerService.sendToPeer(room.sender.peerId, peerJoinedResponse);
+      this.peerService.sendToPeer(createPeerId(room.senderPeerId), peerJoinedResponse);
     }
 
-    console.log(`[SignalHandler] Receiver joined room: ${roomId}`);
+    console.log(`[SignalHandler] Receiver ${peerId} joined room ${roomId}`);
   }
 
   /**
@@ -125,7 +126,7 @@ export class SignalHandler {
    */
   private handleOffer(peerId: any, roomId: any, sdp: string): void {
     const room = this.roomService.getRoom(roomId);
-    if (!room || !room.receiver) {
+    if (!room?.receiverPeerId) {
       this.sendErrorToPeer(peerId, 'Room not found or receiver not ready');
       return;
     }
@@ -134,11 +135,11 @@ export class SignalHandler {
       type: 'offer',
       roomId,
       sdp,
-      peerId: room.sender?.peerId || createPeerId('unknown'),
+      peerId: createPeerId(peerId),
     };
 
-    this.peerService.sendToPeer(room.receiver.peerId, response);
-    console.log(`[SignalHandler] Offer sent from ${room.sender?.peerId} to ${room.receiver.peerId}`);
+    this.peerService.sendToPeer(createPeerId(room.receiverPeerId), response);
+    console.log(`[SignalHandler] Offer forwarded from ${peerId} to ${room.receiverPeerId}`);
   }
 
   /**
@@ -146,7 +147,7 @@ export class SignalHandler {
    */
   private handleAnswer(peerId: any, roomId: any, sdp: string): void {
     const room = this.roomService.getRoom(roomId);
-    if (!room || !room.sender) {
+    if (!room?.senderPeerId) {
       this.sendErrorToPeer(peerId, 'Room not found or sender not ready');
       return;
     }
@@ -155,11 +156,11 @@ export class SignalHandler {
       type: 'answer',
       roomId,
       sdp,
-      peerId: room.receiver?.peerId || createPeerId('unknown'),
+      peerId: createPeerId(peerId),
     };
 
-    this.peerService.sendToPeer(room.sender.peerId, response);
-    console.log(`[SignalHandler] Answer sent from ${room.receiver?.peerId} to ${room.sender.peerId}`);
+    this.peerService.sendToPeer(createPeerId(room.senderPeerId), response);
+    console.log(`[SignalHandler] Answer forwarded from ${peerId} to ${room.senderPeerId}`);
   }
 
   /**
@@ -172,17 +173,11 @@ export class SignalHandler {
       return;
     }
 
-    // Store candidate
-    const peerIdObj = createPeerId(peerId);
-    this.roomService.addIceCandidate(roomId, peerIdObj, candidate);
-
-    // Determine which peer sent this and send to the other
-    let targetPeerId = null;
-
-    if (room.sender?.peerId === peerId) {
-      targetPeerId = room.receiver?.peerId;
-    } else if (room.receiver?.peerId === peerId) {
-      targetPeerId = room.sender?.peerId;
+    let targetPeerId: string | undefined;
+    if (room.senderPeerId === peerId) {
+      targetPeerId = room.receiverPeerId;
+    } else if (room.receiverPeerId === peerId) {
+      targetPeerId = room.senderPeerId;
     }
 
     if (targetPeerId) {
@@ -192,26 +187,20 @@ export class SignalHandler {
         candidate,
         peerId: createPeerId(peerId),
       };
-
-      this.peerService.sendToPeer(targetPeerId, response);
+      this.peerService.sendToPeer(createPeerId(targetPeerId), response);
     }
   }
 
   /**
-   * Handle disconnect signal
+   * Handle explicit disconnect signal
    */
   private handleDisconnect(peerId: any, roomId?: any): void {
     if (roomId) {
       const room = this.roomService.getRoom(roomId);
       if (room) {
-        // Notify other peer
-        let otherPeerId = null;
-
-        if (room.sender?.peerId === peerId) {
-          otherPeerId = room.receiver?.peerId;
-        } else if (room.receiver?.peerId === peerId) {
-          otherPeerId = room.sender?.peerId;
-        }
+        let otherPeerId: string | undefined;
+        if (room.senderPeerId === peerId)   otherPeerId = room.receiverPeerId;
+        else if (room.receiverPeerId === peerId) otherPeerId = room.senderPeerId;
 
         if (otherPeerId) {
           const notification: ServerSignal = {
@@ -219,11 +208,9 @@ export class SignalHandler {
             roomId,
             peerId: createPeerId(peerId),
           };
-
-          this.peerService.sendToPeer(otherPeerId, notification);
+          this.peerService.sendToPeer(createPeerId(otherPeerId), notification);
         }
 
-        // Clean up room if both peers are gone
         this.roomService.deleteRoom(roomId);
         console.log(`[SignalHandler] Room deleted: ${roomId}`);
       }
@@ -234,22 +221,15 @@ export class SignalHandler {
   }
 
   /**
-   * Handle peer disconnect (connection closed)
+   * Handle peer disconnect (WebSocket close)
    */
   handlePeerDisconnect(peerId: any): void {
     const roomId = this.peerService.getPeerRoom(createPeerId(peerId));
     this.handleDisconnect(peerId, roomId);
   }
 
-  /**
-   * Send error to peer
-   */
   private sendErrorToPeer(peerId: any, message: string): void {
-    const response: ServerSignal = {
-      type: 'error',
-      message,
-    };
-
+    const response: ServerSignal = { type: 'error', message };
     this.peerService.sendToPeer(createPeerId(peerId), response);
   }
 }
